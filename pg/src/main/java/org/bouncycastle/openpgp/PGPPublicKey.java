@@ -634,10 +634,6 @@ public class PGPPublicKey
         }
         
         out.writePacket(publicPk);
-        if (trustPk != null)
-        {
-            out.writePacket(trustPk);
-        }
         
         if (subSigs == null)    // not a sub-key
         {
