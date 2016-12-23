@@ -1046,15 +1046,15 @@ public class PGPPublicKey
 
         if (!found)
         {
-            for (Iterator it = key.getRawUserIDs(); it.hasNext();)
+            for (Iterator it = key.getUserIDs(); it.hasNext();)
             {
-                UserIDPacket id = (UserIDPacket)it.next();
+                String id = (String)it.next();
                 for (Iterator sIt = key.getSignaturesForID(id); sIt.hasNext();)
                 {
                     if (certification == sIt.next())
                     {
                         found = true;
-                        returnKey = PGPPublicKey.removeCertification(returnKey, id.getRawID(), certification);
+                        returnKey = PGPPublicKey.removeCertification(returnKey, id, certification);
                     }
                 }
             }
