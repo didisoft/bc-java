@@ -1,11 +1,17 @@
 package org.bouncycastle.openpgp;
 
 import java.io.EOFException;
+import java.io.IOException;
 import java.io.InputStream;
 
+import org.bouncycastle.crypto.*;
+import org.bouncycastle.crypto.modes.AEADBlockCipher;
+import org.bouncycastle.crypto.params.AEADParameters;
+import org.bouncycastle.crypto.params.KeyParameter;
 import org.bouncycastle.bcpg.BCPGInputStream;
 import org.bouncycastle.bcpg.InputStreamPacket;
 import org.bouncycastle.bcpg.PublicKeyEncSessionPacket;
+import org.bouncycastle.bcpg.AeadEncryptedPacket;
 import org.bouncycastle.bcpg.SymmetricEncIntegrityPacket;
 import org.bouncycastle.bcpg.SymmetricKeyAlgorithmTags;
 import org.bouncycastle.openpgp.operator.PGPDataDecryptor;
@@ -114,6 +120,218 @@ public class PGPPublicKeyEncryptedData
         return getDataStream(dataDecryptorFactory, dataDecryptorFactory.getSessionKey());
     }
 
+    private InputStream decryptAead(PGPSessionKey sessionKey, AeadEncryptedPacket packet)
+    {
+        encStream = new BCPGInputStream(
+                new AeadCipherStream(false, 
+                                    packet.getDataStream(), 
+                                    new KeyParameter(sessionKey.getKey(), 0, sessionKey.getKey().length),
+                                    packet));
+
+        return encStream;
+    }
+    
+    private class AeadCipherStream extends InputStream
+    {
+        private boolean forEncryption;
+        private InputStream stream;
+        private AEADBlockCipher inCipher;
+        private byte[] mInBuf;
+        private int mInPos;            
+        private boolean inStreamEnded;
+        private KeyParameter key;
+        private AeadEncryptedPacket packet;
+        private long chunkIndex;
+        private long bytesProcessed;
+
+        public AeadCipherStream(
+                    boolean forEncryption,
+                    InputStream stream,
+                    KeyParameter key,
+                    AeadEncryptedPacket packet)
+        {
+            this.forEncryption = forEncryption;
+            this.stream = stream;
+            this.key = key;
+            this.packet = packet;
+            this.chunkIndex = 0;
+            this.bytesProcessed = 0;
+
+            inCipher = packet.createCipher();
+            mInBuf = null;
+        }
+
+        public int read() throws java.io.IOException
+        {
+            if (inCipher == null)
+                return stream.read();
+
+            if (mInBuf == null || mInPos >= mInBuf.length)
+            {
+            	try {
+                    if (!fillInBuf())
+                        return -1;
+            	} catch (InvalidCipherTextException e) {
+            		throw new IOException(e);
+            	}
+            }
+
+            return (int)(mInBuf[mInPos++] & 0xff);
+        }
+
+        public int read(
+            byte[] buffer,
+            int offset,
+            int count) throws IOException
+        {
+            int num = 0;
+            while (num < count)
+            {
+                if (mInBuf == null || mInPos >= mInBuf.length)
+                {
+                	try {
+                		if (!fillInBuf())
+                			break;
+                	} catch (InvalidCipherTextException e) {
+                		throw new IOException(e);
+                	}
+                }
+
+                int numToCopy = Math.min(count - num, mInBuf.length - mInPos);
+                System.arraycopy(mInBuf, mInPos, buffer, offset + num, numToCopy);
+                mInPos += numToCopy;
+                num += numToCopy;
+            }
+
+            return num;
+        }
+
+        private boolean fillInBuf() throws IOException, InvalidCipherTextException
+        {
+            if (inStreamEnded)
+                return false;
+
+            mInPos = 0;
+            do
+            {
+                mInBuf = readAndProcessBlock();
+            }
+            while (!inStreamEnded && mInBuf == null);
+
+            return mInBuf != null;
+        }
+
+        private byte[] readAndProcessBlock() throws IOException, InvalidCipherTextException
+        {
+            byte[] adata = { (byte)(0xC0 | 20), packet.getVersion(), (byte)packet.getAlgorithm(), (byte)packet.getMode(), (byte)packet.getChunkSizeBytes(),
+                (byte)((chunkIndex >> 56) & 0xFF),
+                (byte)((chunkIndex >> 48) & 0xFF),
+                (byte)((chunkIndex >> 40) & 0xFF),
+                (byte)((chunkIndex >> 32) & 0xFF),
+                (byte)((chunkIndex >> 24) & 0xFF),
+                (byte)((chunkIndex >> 16) & 0xFF),
+                (byte)((chunkIndex >> 8) & 0xFF),
+                (byte)(chunkIndex & 0xFF)};
+
+            this.inCipher = packet.createCipher();
+            AEADParameters parameters = new AEADParameters(key,
+                                                packet.getTagLength() * 8,
+                                                packet.getNonce(this.chunkIndex), adata);
+            inCipher.init(this.forEncryption, parameters);
+
+            int tagLenIfDecrypting = (this.forEncryption ? 0 : this.packet.getTagLength());
+            int tagLenIfEncrypting = (this.forEncryption ? this.packet.getTagLength() : 0);
+                        
+            int readSize = packet.getChunkSize() + tagLenIfDecrypting;
+            byte[] block = new byte[readSize];
+            int numRead = 0;
+            do
+            {
+                int count = stream.read(block, numRead, block.length - numRead);
+                if (count < 1)
+                {
+                    inStreamEnded = true;
+                    break;
+                }
+                numRead += count;
+            }
+            while (numRead < block.length);
+
+            this.bytesProcessed += numRead - tagLenIfDecrypting;
+
+            byte[] bytes = null;
+            if (packet.getChunkSize() > numRead)
+            {
+                    byte[] lastBlock = new byte[numRead - tagLenIfDecrypting];
+                    System.arraycopy(block, 0, lastBlock, 0, numRead - tagLenIfDecrypting);
+                    
+                    bytes = new byte[lastBlock.length + tagLenIfEncrypting - tagLenIfDecrypting];
+                    inCipher.processBytes(lastBlock, 0, lastBlock.length, bytes, 0);
+                    inCipher.doFinal(bytes, 0);
+
+                    // Final Tail tag
+                    this.chunkIndex++;
+                    this.bytesProcessed -= tagLenIfDecrypting;
+
+                    byte[] adataLast = 
+                     { (byte)(0xC0 | 20), packet.getVersion(), (byte)packet.getAlgorithm(), (byte)packet.getMode(), (byte)packet.getChunkSizeBytes(),
+                        (byte)((chunkIndex >> 56) & 0xFF),
+                        (byte)((chunkIndex >> 48) & 0xFF),
+                        (byte)((chunkIndex >> 40) & 0xFF),
+                        (byte)((chunkIndex >> 32) & 0xFF),
+                        (byte)((chunkIndex >> 24) & 0xFF),
+                        (byte)((chunkIndex >> 16) & 0xFF),
+                        (byte)((chunkIndex >> 8) & 0xFF),
+                        (byte)(chunkIndex & 0xFF),
+                        (byte)((this.bytesProcessed >> 56)& 0xFF),
+                        (byte)((bytesProcessed >> 48)& 0xFF),
+                        (byte)((bytesProcessed >> 40)& 0xFF),
+                        (byte)((bytesProcessed >> 32)& 0xFF),
+                        (byte)((bytesProcessed >> 24)& 0xFF),
+                        (byte)((bytesProcessed >> 16)& 0xFF),
+                        (byte)((bytesProcessed >> 8)& 0xFF),
+                        (byte)(bytesProcessed& 0xFF) };
+
+                    this.inCipher = packet.createCipher();
+                    parameters = new AEADParameters(key,
+                                                        packet.getTagLength() * 8,
+                                                        packet.getNonce(this.chunkIndex), adataLast);
+                    inCipher.init(this.forEncryption, parameters);
+
+                    byte[] tail = new byte[tagLenIfDecrypting];
+                    System.arraycopy(block, lastBlock.length, tail, 0, tail.length);
+                    byte[] tailProcessed = new byte[tail.length];
+                    inCipher.processBytes(tail, 0, tail.length, tailProcessed, 0);
+                    inCipher.doFinal(tailProcessed, 0);
+
+                    if (this.forEncryption)
+                    {
+                    	bytes = Arrays.concatenate(bytes, tailProcessed);
+                    }
+            }
+            else
+            {
+                bytes = new byte[numRead + tagLenIfEncrypting - tagLenIfDecrypting];
+            	
+                inCipher.processBytes(block, 0, numRead, bytes, 0);
+                inCipher.doFinal(bytes, 0);
+            }
+
+            if (bytes != null && bytes.length == 0)
+            {
+                bytes = null;
+            }
+
+            this.chunkIndex++;
+            return bytes;
+        }
+
+        public void close() throws IOException
+        {
+        	stream.close();
+        }
+    }
+    
     /**
      * Open an input stream which will provide the decrypted data protected by this object.
      *
@@ -131,6 +349,9 @@ public class PGPPublicKeyEncryptedData
         {
             try
             {
+            	if (encData instanceof AeadEncryptedPacket)
+            		return decryptAead(sessionKey, (AeadEncryptedPacket)encData );
+            	
                 boolean withIntegrityPacket = encData instanceof SymmetricEncIntegrityPacket;
 
                 PGPDataDecryptor dataDecryptor = dataDecryptorFactory.createDataDecryptor(withIntegrityPacket, sessionKey.getAlgorithm(), sessionKey.getKey());
